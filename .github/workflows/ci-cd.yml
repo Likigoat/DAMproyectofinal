@@ -1,0 +1,129 @@
+name: Pruebas, calidad y despliegue de prueba
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Cobertura unitaria independiente
+        run: python -m pytest tests/test_core.py tests/test_controllers_unit.py -o addopts='' --cov=app --cov-branch --cov-report=xml:reports/coverage-unit.xml --cov-report=term-missing --cov-fail-under=80 --junitxml=reports/junit-unit.xml
+      - run: python -m pytest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-coverage
+          path: reports/
+  sonarqube:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: pytest-coverage
+          path: reports/
+      - name: Servidor SonarQube aislado para esta ejecución
+        run: |
+          sudo sysctl -w vm.max_map_count=524288
+          docker run -d --name sonar -p 127.0.0.1:9000:9000 sonarqube:community
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:9000/api/system/status | jq -e '.status == "UP"'; then break; fi
+            sleep 5
+          done
+          curl -fsS http://127.0.0.1:9000/api/system/status | jq -e '.status == "UP"'
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          curl -fsS -u admin:admin -X POST http://127.0.0.1:9000/api/users/change_password --data-urlencode login=admin --data-urlencode previousPassword=admin --data-urlencode "password=$password"
+          token=$(curl -fsS -u "admin:$password" -X POST http://127.0.0.1:9000/api/user_tokens/generate --data-urlencode name=ci | jq -er .token)
+          echo "::add-mask::$token"
+          echo "SONAR_TOKEN=$token" >> "$GITHUB_ENV"
+          curl -fsS -u "$token:" -X POST http://127.0.0.1:9000/api/projects/create --data-urlencode project=red-donaciones --data-urlencode 'name=Red de Donaciones'
+      - name: Analizar y esperar Quality Gate
+        run: |
+          chmod -R a+rwX reports
+          mkdir -p .scannerwork
+          chmod a+rwx .scannerwork
+          docker run --rm --network host -e SONAR_TOKEN -e SONAR_HOST_URL=http://127.0.0.1:9000 -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli
+      - name: Exportar métricas y puerta de calidad
+        if: always()
+        run: |
+          curl -fsS -u "$SONAR_TOKEN:" 'http://127.0.0.1:9000/api/measures/component?component=red-donaciones&metricKeys=coverage,bugs,vulnerabilities,code_smells,sqale_index,duplicated_lines_density,security_hotspots,ncloc' > reports/sonar-metrics.json
+          curl -fsS -u "$SONAR_TOKEN:" 'http://127.0.0.1:9000/api/qualitygates/project_status?projectKey=red-donaciones' > reports/sonar-quality-gate.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sonarqube-evidence
+          path: |
+            reports/sonar-*.json
+            .scannerwork/report-task.txt
+      - name: Limpiar servidor temporal
+        if: always()
+        run: docker rm -f sonar
+  staging:
+    needs: [test, sonarqube]
+    if: github.event_name != 'pull_request'
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: pip install -r requirements-dev.txt
+      - name: Construir y desplegar en staging efímero
+        run: |
+          mkdir -p reports
+          secret=$(openssl rand -hex 32)
+          echo "::add-mask::$secret"
+          echo "JWT_SECRET=$secret" >> "$GITHUB_ENV"
+          docker build -t donations:${{ github.sha }} .
+          docker run -d --name donations -p 127.0.0.1:8000:8000 -e JWT_SECRET="$secret" donations:${{ github.sha }}
+          docker exec donations python -c "import secrets; from app.core import initialize, create_user; initialize('/data/donaciones.db'); create_user('/data/donaciones.db', 'admin@example.org', secrets.token_urlsafe(32), 'administrador')"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health
+      - name: Comprobar despliegue con HTTP real
+        run: python -m scripts.smoke
+      - name: Preparar ZAP autenticado
+        run: python -m scripts.prepare_scan
+      - name: Escanear API con ZAP
+        run: |
+          chmod -R a+rwX reports
+          set +e
+          docker run --rm --network host -e ZAP_AUTH_HEADER_VALUE -e ZAP_AUTH_HEADER_SITE=127.0.0.1 -v "$PWD/reports:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t /zap/wrk/openapi-scan.json -f openapi -r zap.html -J zap.json
+          status=$?
+          set -e
+          echo "$status" > reports/zap-exit-code.txt
+          if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
+          python -m scripts.zap_gate
+      - name: Comprobar autenticación al finalizar el escaneo
+        if: success()
+        run: curl -fsS -H "Authorization:$ZAP_AUTH_HEADER_VALUE" http://127.0.0.1:8000/auth/me > reports/zap-auth-check.json
+      - name: Guardar logs
+        if: always()
+        run: docker logs donations > reports/container.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-zap-evidence
+          path: reports/
+      - name: Retirar staging temporal
+        if: always()
+        run: docker rm -f donations

@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET}
+      DATABASE_PATH: /data/donaciones.db
+    volumes:
+      - donations-data:/data
+volumes:
+  donations-data:
