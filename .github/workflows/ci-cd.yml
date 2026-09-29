@@ -45,21 +45,26 @@ jobs:
             sleep 5
           done
           curl -fsS http://127.0.0.1:9000/api/system/status | jq -e '.status == "UP"'
-          password=$(openssl rand -hex 24)
+          password="Aa1!$(openssl rand -hex 24)"
           echo "::add-mask::$password"
-          curl -fsS -u admin:admin -X POST http://127.0.0.1:9000/api/users/change_password --data-urlencode login=admin --data-urlencode previousPassword=admin --data-urlencode "password=$password"
-          token=$(curl -fsS -u "admin:$password" -X POST http://127.0.0.1:9000/api/user_tokens/generate --data-urlencode name=ci | jq -er .token)
+          echo "Configurando contraseña administrativa"
+          curl --fail-with-body -sS -u admin:admin -X POST http://127.0.0.1:9000/api/users/change_password --data-urlencode login=admin --data-urlencode previousPassword=admin --data-urlencode "password=$password"
+          echo "Creando token de análisis"
+          token_response=$(curl --fail-with-body -sS -u "admin:$password" -X POST http://127.0.0.1:9000/api/user_tokens/generate --data-urlencode name=ci) || { printf '%s\n' "$token_response"; exit 1; }
+          token=$(printf '%s' "$token_response" | jq -er .token)
           echo "::add-mask::$token"
           echo "SONAR_TOKEN=$token" >> "$GITHUB_ENV"
-          curl -fsS -u "$token:" -X POST http://127.0.0.1:9000/api/projects/create --data-urlencode project=red-donaciones --data-urlencode 'name=Red de Donaciones'
+          echo "Creando proyecto de análisis"
+          curl --fail-with-body -sS -u "$token:" -X POST http://127.0.0.1:9000/api/projects/create --data-urlencode project=red-donaciones --data-urlencode 'name=Red de Donaciones'
       - name: Analizar y esperar Quality Gate
+        id: scan
         run: |
           chmod -R a+rwX reports
           mkdir -p .scannerwork
           chmod a+rwx .scannerwork
           docker run --rm --network host -e SONAR_TOKEN -e SONAR_HOST_URL=http://127.0.0.1:9000 -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli
       - name: Exportar métricas y puerta de calidad
-        if: always()
+        if: ${{ always() && env.SONAR_TOKEN != '' && steps.scan.outcome != 'skipped' }}
         run: |
           curl -fsS -u "$SONAR_TOKEN:" 'http://127.0.0.1:9000/api/measures/component?component=red-donaciones&metricKeys=coverage,bugs,vulnerabilities,code_smells,sqale_index,duplicated_lines_density,security_hotspots,ncloc' > reports/sonar-metrics.json
           curl -fsS -u "$SONAR_TOKEN:" 'http://127.0.0.1:9000/api/qualitygates/project_status?projectKey=red-donaciones' > reports/sonar-quality-gate.json
